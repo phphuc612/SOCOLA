@@ -8,12 +8,17 @@
 
 import argparse
 import builtins
+import logging
 import math
 import os
 import random
 import shutil
 import time
 import warnings
+import numpy as np
+import wandb
+
+from dataset.coco import COCODataset
 
 import moco.builder
 import moco.loader
@@ -29,7 +34,11 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
+import utils
+import psutil
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger = logging.getLogger(__name__)
 
 model_names = sorted(
     name
@@ -45,12 +54,13 @@ parser.add_argument(
     metavar="ARCH",
     default="resnet50",
     choices=model_names,
-    help="model architecture: " + " | ".join(model_names) + " (default: resnet50)",
+    help="model architecture: " +
+    " | ".join(model_names) + " (default: resnet50)",
 )
 parser.add_argument(
     "-j",
     "--workers",
-    default=32,
+    default=16,
     type=int,
     metavar="N",
     help="number of data loading workers (default: 32)",
@@ -151,35 +161,51 @@ parser.add_argument(
 
 # moco specific configs:
 parser.add_argument(
-    "--moco-dim", default=128, type=int, help="feature dimension (default: 128)"
+    "--dim", default=128, type=int, help="feature dimension (default: 128)"
 )
 parser.add_argument(
-    "--moco-k",
-    default=65536,
-    type=int,
-    help="queue size; number of negative keys (default: 65536)",
+    "--T", default=0.07, type=float, help="softmax temperature (default: 0.07)"
 )
 parser.add_argument(
-    "--moco-m",
-    default=0.999,
-    type=float,
-    help="moco momentum of updating key encoder (default: 0.999)",
+    "--sub-batch-size", default=32, type=int, help="sub batch size (default: 32)"
 )
-parser.add_argument(
-    "--moco-t", default=0.07, type=float, help="softmax temperature (default: 0.07)"
-)
-
 # options for moco v2
 parser.add_argument("--mlp", action="store_true", help="use mlp head")
 parser.add_argument(
     "--aug-plus", action="store_true", help="use moco v2 data augmentation"
 )
-parser.add_argument("--cos", action="store_true", help="use cosine lr schedule")
-
+parser.add_argument("--cos", action="store_true",
+                    help="use cosine lr schedule")
+parser.add_argument("--subset", default=1, type=float, help="subset of data to use")
 
 def main():
     args = parser.parse_args()
-
+    wandb.init(
+        project="SOCOLA",
+        config={
+            "arch": args.arch,
+            "temp": args.T,
+            "dim": args.dim,
+            "sub_batch_size": args.sub_batch_size,
+            "lr": args.lr,
+            "cos": args.cos,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "weight_decay": args.weight_decay,
+            "workers": args.workers,
+            "seed": args.seed,
+            "world_size": args.world_size,
+            "rank": args.rank,
+            "dist_url": args.dist_url,
+            "dist_backend": args.dist_backend,
+            "gpu": args.gpu,
+            "multiprocessing_distributed": args.multiprocessing_distributed,
+            "schedule": args.schedule,
+            "aug_plus": args.aug_plus,
+            "mlp": args.mlp,
+            "subset": args.subset,
+        }
+    )
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -210,7 +236,8 @@ def main():
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node,
+                 args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
@@ -247,18 +274,18 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
         models.__dict__[args.arch],
-        args.moco_dim,
-        args.moco_k,
-        args.moco_m,
-        args.moco_t,
+        args.sub_batch_size,
+        args.dim,
+        args.T,
         args.mlp,
     )
     print(model)
-
+    criterion = None
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
+        # define loss function (criterion) and optimizer
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
@@ -266,7 +293,8 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            args.workers = int(
+                (args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(
                 model, device_ids=[args.gpu]
             )
@@ -281,17 +309,12 @@ def main_worker(gpu, ngpus_per_node, args):
         # comment out the following line for debugging
         raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
-        # AllGather implementation (batch shuffle, queue update, etc.) in
-        # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        model = model.to(device)
 
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(
+    # TODO: switch to ADAMW
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         args.lr,
-        momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
 
@@ -319,7 +342,7 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, "train")
+    datadir = args.data
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
@@ -332,7 +355,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 p=0.8,  # not strengthened
             ),
             transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([0.1, 2.0])], p=0.5),
+            transforms.RandomApply(
+                [moco.loader.GaussianBlur([0.1, 2.0])], p=0.5),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
@@ -348,15 +372,34 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]
 
+    # train_dataset = datasets.ImageFolder(
+    #     traindir, moco.loader.TwoCropsTransform(
+    #         transforms.Compose(augmentation))
+    # )
     train_dataset = datasets.ImageFolder(
-        traindir, moco.loader.TwoCropsTransform(transforms.Compose(augmentation))
+        os.path.join(datadir, "ILSVRC/imagenet"),
+        moco.loader.TwoCropsTransform(
+            transforms.Compose(augmentation)
+        ),
     )
-
+    if args.subset < 1:
+        subset = int(len(train_dataset) * args.subset)
+        indices = torch.randperm(len(train_dataset))[:subset]
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
+    # train_dataset = COCODataset(
+    #     data_dir=os.path.join(datadir, "coco"),
+    #     transform=moco.loader.TwoCropsTransform(
+    #         transforms.Compose(augmentation)
+    #     ),
+    #     annotation_dir=os.path.join(datadir, "coco/annotations"),
+    #     split="val",
+    # )
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset)
     else:
         train_sampler = None
-
+    print("distrbitued", args.distributed)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -373,8 +416,8 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
-
+        log_output = train(train_loader, model, optimizer, epoch, device, args)
+        wandb.log(log_output, step=epoch)
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
@@ -390,52 +433,121 @@ def main_worker(gpu, ngpus_per_node, args):
             )
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4e")
-    top1 = AverageMeter("Acc@1", ":6.2f")
-    top5 = AverageMeter("Acc@5", ":6.2f")
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}]".format(epoch),
-    )
+# def train(train_loader, model, optimizer, epoch, args):
+#     batch_time = AverageMeter("Time", ":6.3f")
+#     data_time = AverageMeter("Data", ":6.3f")
+#     losses = AverageMeter("Loss", ":.4e")
+#     top1 = AverageMeter("Acc@1", ":6.2f")
+#     top5 = AverageMeter("Acc@5", ":6.2f")
+#     progress = ProgressMeter(
+#         len(train_loader),
+#         [batch_time, data_time, losses, top1, top5],
+#         prefix="Epoch: [{}]".format(epoch),
+#     )
 
-    # switch to train mode
+#     # switch to train mode
+#     model.train()
+
+#     end = time.time()
+#     for i, (images, _) in enumerate(train_loader):
+#         # measure data loading time
+#         data_time.update(time.time() - end)
+
+#         if args.gpu is not None:
+#             images[0] = images[0].cuda(args.gpu, non_blocking=True)
+#             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+
+#         # compute output
+#         loss, output, target = model(im_q=images[0], im_k=images[1])
+
+
+#         # acc1/acc5 are (K+1)-way contrast classifier accuracy
+#         # measure accuracy and record loss
+#         acc1, acc5 = accuracy(output, target, topk=(1, 5))
+#         losses.update(loss.item(), images[0].size(0))
+#         top1.update(acc1[0], images[0].size(0))
+#         top5.update(acc5[0], images[0].size(0))
+
+#         # compute gradient and do SGD step
+#         optimizer.zero_grad()
+#         loss.backward()
+#         optimizer.step()
+
+#         # measure elapsed time
+#         batch_time.update(time.time() - end)
+#         end = time.time()
+
+#         if i % args.print_freq == 0:
+#             progress.display(i)
+
+def train(
+    data_loader,
+    model,
+    optimizer,
+    epoch,
+    device,
+    args,
+):
+    # train
+    wandb.watch(model, log="all", log_freq=20)
     model.train()
 
-    end = time.time()
-    for i, (images, _) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter(
+        "lr", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
+    )
+    metric_logger.add_meter(
+        "temp", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
+    )
+    metric_logger.add_meter(
+        "avg_loss", utils.SmoothedValue(window_size=50, fmt="{value:.4f}")
+    )
 
-        if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+    header = "Train Epoch: [{}]".format(epoch)
+    print_freq = 20
+    # step_size = 50
+    # warmup_iterations = warmup_steps * step_size
 
-        # compute output
-        output, target = model(im_q=images[0], im_k=images[1])
-        loss = criterion(output, target)
+    if args.distributed:
+        data_loader.sampler.set_epoch(epoch)
+    print(len(data_loader))
 
-        # acc1/acc5 are (K+1)-way contrast classifier accuracy
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images[0].size(0))
-        top1.update(acc1[0], images[0].size(0))
-        top5.update(acc5[0], images[0].size(0))
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
+    
+    for iteration_cnt, (imgs, _) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, logger, header)
+    ):
+        # logger.info(f"ram: {int(np.round(psutil.virtual_memory()[3] / (1000. **3))) }")  # total physical memory in Bytes
+        optimizer.zero_grad(set_to_none=True)
+        
+        query_img = imgs[0].to(device)
+        key_img = imgs[1].to(device)
+        avg_loss, logits, labels = model(query_img, key_img, device)
+
+        acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
         optimizer.step()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            progress.display(i)
+        metric_logger.update(avg_loss=avg_loss)
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(temp=model.T.item())
+        metric_logger.update(acc1=acc1[0].item())
+        metric_logger.update(acc5=acc5[0].item())
+        if iteration_cnt % print_freq == 0:
+            wandb.log({
+                "epoch": epoch,
+                "avg_loss": avg_loss,
+                "lr": optimizer.param_groups[0]["lr"],
+                "temp": model.T.item(),
+                "acc1": acc1[0].item(),
+                "acc5": acc5[0].item(),
+            }, step=epoch * len(data_loader) + iteration_cnt)
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    logger.info(f"Averaged stats: {metric_logger.global_avg()}")
+    return {
+        k: "{:.9f}".format(meter.global_avg)
+        for k, meter in metric_logger.meters.items()
+    }
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -505,12 +617,12 @@ def accuracy(output, target, topk=(1,)):
         batch_size = target.size(0)
 
         _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        pred = pred.t() # N x maxk -> maxk x N
+        correct = pred.eq(target.view(1, -1).expand_as(pred)) # maxk x N
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
