@@ -36,10 +36,11 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import utils
 import psutil
+from PIL import Image
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger = logging.getLogger(__name__)
-
+run = None
 model_names = sorted(
     name
     for name in models.__dict__
@@ -178,9 +179,22 @@ parser.add_argument("--cos", action="store_true",
                     help="use cosine lr schedule")
 parser.add_argument("--subset", default=1, type=float, help="subset of data to use")
 
+parser.add_argument("--save-dir", default=".", type=str, help="save directory")
+
+parser.add_argument("--eval-only", default="", help="path to checkpoint for evaluation only")
 def main():
     args = parser.parse_args()
-    wandb.init(
+    if args.resume or args.eval_only:
+        if not args.resume:
+            path = args.eval_only
+        else:
+            path = args.resume
+        parent_dir = os.path.dirname(path)
+        print("parend dir", parent_dir)
+        with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
+            runid = f.read()
+    global run
+    run = wandb.init(
         project="SOCOLA",
         config={
             "arch": args.arch,
@@ -204,8 +218,12 @@ def main():
             "aug_plus": args.aug_plus,
             "mlp": args.mlp,
             "subset": args.subset,
-        }
+        },
+        id=runid,
+        resume="allow",
     )
+    wandb.define_metric("epochs")
+    wandb.define_metric("epoch/*", step_metric="epochs")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -338,7 +356,19 @@ def main_worker(gpu, ngpus_per_node, args):
             )
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
-
+    elif args.eval_only:
+        if os.path.isfile(args.eval_only):
+            print("=> loading checkpoint '{}'".format(args.eval_only))
+            if args.gpu is None:
+                checkpoint = torch.load(args.eval_only)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = "cuda:{}".format(args.gpu)
+                checkpoint = torch.load(args.eval_only, map_location=loc)
+            model.load_state_dict(checkpoint["state_dict"])
+            args.start_epoch = checkpoint["epoch"] - 1
+            args.epochs = args.start_epoch + 1
+            print("=> loaded checkpoint '{}'".format(args.eval_only))
     cudnn.benchmark = True
 
     # Data loading code
@@ -371,18 +401,20 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]
-
-    # train_dataset = datasets.ImageFolder(
-    #     traindir, moco.loader.TwoCropsTransform(
-    #         transforms.Compose(augmentation))
-    # )
-    train_dataset = datasets.ImageFolder(
-        os.path.join(datadir, "ILSVRC/imagenet"),
+    if not args.eval_only:
+        train_dataset = datasets.ImageFolder(
+            os.path.join(datadir, "ILSVRC/imagenet"),
+            moco.loader.TwoCropsTransform(
+                transforms.Compose(augmentation)
+            ),
+        )
+    val_dataset = datasets.ImageFolder(
+        os.path.join(datadir, "ILSVRC/imagenet_val"),
         moco.loader.TwoCropsTransform(
             transforms.Compose(augmentation)
         ),
     )
-    if args.subset < 1:
+    if args.subset < 1 and not args.eval_only:
         subset = int(len(train_dataset) * args.subset)
         indices = torch.randperm(len(train_dataset))[:subset]
         train_dataset = torch.utils.data.Subset(train_dataset, indices)
@@ -400,27 +432,53 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         train_sampler = None
     print("distrbitued", args.distributed)
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+    if not args.eval_only:
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            num_workers=args.workers,
+            pin_memory=True,
+            sampler=train_sampler,
+            drop_last=True,
+        )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
+        shuffle=False,
         num_workers=args.workers,
         pin_memory=True,
-        sampler=train_sampler,
         drop_last=True,
     )
-
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
 
-        # train for one epoch
-        log_output = train(train_loader, model, optimizer, epoch, device, args)
-        wandb.log(log_output, step=epoch)
-        if not args.multiprocessing_distributed or (
+        wandb_log_output = {"epochs": epoch} # log epoch
+        if not args.eval_only:
+            adjust_learning_rate(optimizer, epoch, args)
+
+            # train for one epoch
+            train_output = train(train_loader, model, optimizer, epoch, device, args)
+            train_output = {f"epoch/train-{k}": v for k, v in train_output.items()}
+            wandb_log_output.update(train_output)
+
+        eval_output = evaluate(val_loader, model, epoch, device, args)
+        eval_output = {f"epoch/eval-{k}": v for k, v in eval_output.items()}
+        print(eval_output)
+        wandb_log_output.update(eval_output)
+        wandb.log(wandb_log_output)
+
+        if not args.eval_only and not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
+            pwd = os.getcwd()
+            directory = os.path.join(pwd, args.save_dir)
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+                with open(os.path.join(directory, "runid.txt"), "w") as f:
+                    f.write(run.id)
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -429,56 +487,9 @@ def main_worker(gpu, ngpus_per_node, args):
                     "optimizer": optimizer.state_dict(),
                 },
                 is_best=False,
-                filename="checkpoint_{:04d}.pth.tar".format(epoch),
+                filename=os.path.join(directory, "checkpoint_{:04d}.pth.tar".format(epoch)),
             )
 
-
-# def train(train_loader, model, optimizer, epoch, args):
-#     batch_time = AverageMeter("Time", ":6.3f")
-#     data_time = AverageMeter("Data", ":6.3f")
-#     losses = AverageMeter("Loss", ":.4e")
-#     top1 = AverageMeter("Acc@1", ":6.2f")
-#     top5 = AverageMeter("Acc@5", ":6.2f")
-#     progress = ProgressMeter(
-#         len(train_loader),
-#         [batch_time, data_time, losses, top1, top5],
-#         prefix="Epoch: [{}]".format(epoch),
-#     )
-
-#     # switch to train mode
-#     model.train()
-
-#     end = time.time()
-#     for i, (images, _) in enumerate(train_loader):
-#         # measure data loading time
-#         data_time.update(time.time() - end)
-
-#         if args.gpu is not None:
-#             images[0] = images[0].cuda(args.gpu, non_blocking=True)
-#             images[1] = images[1].cuda(args.gpu, non_blocking=True)
-
-#         # compute output
-#         loss, output, target = model(im_q=images[0], im_k=images[1])
-
-
-#         # acc1/acc5 are (K+1)-way contrast classifier accuracy
-#         # measure accuracy and record loss
-#         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-#         losses.update(loss.item(), images[0].size(0))
-#         top1.update(acc1[0], images[0].size(0))
-#         top5.update(acc5[0], images[0].size(0))
-
-#         # compute gradient and do SGD step
-#         optimizer.zero_grad()
-#         loss.backward()
-#         optimizer.step()
-
-#         # measure elapsed time
-#         batch_time.update(time.time() - end)
-#         end = time.time()
-
-#         if i % args.print_freq == 0:
-#             progress.display(i)
 
 def train(
     data_loader,
@@ -505,8 +516,6 @@ def train(
 
     header = "Train Epoch: [{}]".format(epoch)
     print_freq = 20
-    # step_size = 50
-    # warmup_iterations = warmup_steps * step_size
 
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
@@ -541,14 +550,58 @@ def train(
                 "acc1": acc1[0].item(),
                 "acc5": acc5[0].item(),
             }, step=epoch * len(data_loader) + iteration_cnt)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info(f"Averaged stats: {metric_logger.global_avg()}")
     return {
-        k: "{:.9f}".format(meter.global_avg)
+        k: meter.global_avg
         for k, meter in metric_logger.meters.items()
     }
 
+def evaluate(
+    data_loader,
+    model,
+    epoch,
+    device,
+    args,
+):
+    # eval
+    print("evaluate step")
+    model.eval()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter(
+        "avg_loss", utils.SmoothedValue(window_size=50, fmt="{value:.4f}")
+    )
+
+    header = "Eval Epoch: [{}]".format(epoch)
+    print_freq = 20
+
+    if args.distributed:
+        data_loader.sampler.set_epoch(epoch)
+    print(len(data_loader))
+
+
+    with torch.no_grad():
+        for _, (imgs, _) in enumerate(data_loader):            
+            query_img = imgs[0].to(device)
+            key_img = imgs[1].to(device)
+            avg_loss, logits, labels = model(query_img, key_img, device)
+
+            acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
+
+            metric_logger.update(avg_loss=avg_loss)
+            metric_logger.update(acc1=acc1[0].item())
+            metric_logger.update(acc5=acc5[0].item())
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    logger.info(f"Averaged stats: {metric_logger.global_avg()}")
+    return {
+        k: meter.global_avg
+        for k, meter in metric_logger.meters.items()
+    }
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
     torch.save(state, filename)
