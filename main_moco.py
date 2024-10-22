@@ -647,8 +647,6 @@ def kNN(args, epoch, model, trainloader, testloader, K, sigma, class_index=None)
     # and store the features in the bank, then use the bank to do kNN
 
     model.eval()
-    # model_time = AverageMeter()
-    # cls_time = AverageMeter()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter(
         "model_time", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
@@ -668,24 +666,6 @@ def kNN(args, epoch, model, trainloader, testloader, K, sigma, class_index=None)
     total = 0
     testsize = testloader.dataset.__len__()
 
-    # trainFeatures = lemniscate.memory.t()
-    # if hasattr(trainloader.dataset, 'imgs'):
-    #     trainLabels = torch.LongTensor([y for (p, y) in trainloader.dataset.imgs]).cuda()
-    # else:
-    #     trainLabels = torch.LongTensor(trainloader.dataset.train_labels).cuda()
-    # C = trainLabels.max() + 1
-
-    # if recompute_memory:
-    #     transform_bak = trainloader.dataset.transform
-    #     trainloader.dataset.transform = testloader.dataset.transform
-    #     temploader = torch.utils.data.DataLoader(trainloader.dataset, batch_size=100, shuffle=False, num_workers=1)
-    #     for batch_idx, (inputs, targets, indexes) in enumerate(temploader):
-    #         targets = targets.cuda(async=True)
-    #         batchSize = inputs.size(0)
-    #         features = model(inputs)
-    #         trainFeatures[:, batch_idx*batchSize:batch_idx*batchSize+batchSize] = features.data.t()
-    #     trainLabels = torch.LongTensor(temploader.dataset.train_labels).cuda()
-    #     trainloader.dataset.transform = transform_bak
     train_features = []
     train_labels = []
     C = None
@@ -757,15 +737,6 @@ def kNN(args, epoch, model, trainloader, testloader, K, sigma, class_index=None)
             total += targets.size(0)
             metric_logger.update(top1=top1 * 100. / total)
             metric_logger.update(top5=top5 * 100. / total)
-            # print('Test [{}/{}]\t'
-            #       'model Time {model_time.val:.3f} ({model_time.avg:.3f})\t'
-            #       'Cls Time {cls_time.val:.3f} ({cls_time.avg:.3f})\t'
-            #       'Top1: {:.2f}  Top5: {:.2f}'.format(
-            #       total, testsize, top1*100./total, top5*100./total, model_time=model_time, cls_time=cls_time))
-
-    # print(epoch, top1*100./total)
-
-    # return {"top1": top1 * 100. /total, "top5": top5 * 100. /total, "epochs": epoch}
     return {
         k: meter.global_avg
         for k, meter in metric_logger.meters.items()
