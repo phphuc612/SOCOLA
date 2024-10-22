@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from random import shuffle
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +39,7 @@ class MoCo(nn.Module):
             self.encoder_img.fc = nn.Sequential(
                 nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_img.fc
             )
-        
+
     def forward(self, all_query_imgs, all_key_imgs, device):
         """
         Input:
@@ -56,7 +58,14 @@ class MoCo(nn.Module):
             key_img_embeds = torch.concat(key_img_embeds)
             key_img_embeds = F.normalize(key_img_embeds, dim=1)
 
-            all_labels = torch.arange(all_query_imgs.shape[0], device=device)
+            shuffled_idx = torch.randperm(all_query_imgs.shape[0])
+            key_img_embeds = key_img_embeds[shuffled_idx]
+
+            all_labels = torch.empty_like(shuffled_idx)
+            all_labels.scatter_(0, shuffled_idx, torch.arange(
+                len(shuffled_idx)
+            ))
+            all_labels = all_labels.to(device)
         all_sims = []
         avg_loss = 0
         for sub_id, query_imgs in enumerate(sub_query_images):
@@ -71,13 +80,14 @@ class MoCo(nn.Module):
             all_sims.append(sim.detach())
 
             # losses
-            loss = F.cross_entropy(sim, all_labels[start_id:end_id], reduction="mean")
+            loss = F.cross_entropy(
+                sim, all_labels[start_id:end_id], reduction="mean")
             loss /= len(sub_query_images)
             avg_loss += loss.item()
             if loss.grad_fn is not None:
                 loss.backward()
         all_sims = torch.concat(all_sims)
-        
+
         return avg_loss, all_sims, all_labels
 
 # N x K

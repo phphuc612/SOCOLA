@@ -12,7 +12,8 @@ import random
 import shutil
 import time
 import warnings
-
+import wandb
+import utils
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -26,7 +27,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_names = sorted(
     name
     for name in models.__dict__
@@ -41,7 +42,8 @@ parser.add_argument(
     metavar="ARCH",
     default="resnet50",
     choices=model_names,
-    help="model architecture: " + " | ".join(model_names) + " (default: resnet50)",
+    help="model architecture: " +
+    " | ".join(model_names) + " (default: resnet50)",
 )
 parser.add_argument(
     "-j",
@@ -87,7 +89,8 @@ parser.add_argument(
     type=int,
     help="learning rate schedule (when to drop lr by a ratio)",
 )
-parser.add_argument("--momentum", default=0.9, type=float, metavar="M", help="momentum")
+parser.add_argument("--momentum", default=0.9, type=float,
+                    metavar="M", help="momentum")
 parser.add_argument(
     "--wd",
     "--weight-decay",
@@ -154,12 +157,66 @@ parser.add_argument(
     "--pretrained", default="", type=str, help="path to moco pretrained checkpoint"
 )
 
+parser.add_argument(
+    "--subset",
+    default=1,
+    type=float,
+    help="subset of the training set to use (default: 1)",
+)
+
+parser.add_argument(
+    "--save-dir",
+    default="linear_probing",
+    type=str,
+    help="path to save checkpoint",
+)
+
 best_acc1 = 0
 
 
 def main():
     args = parser.parse_args()
-
+    runid = None
+    if args.resume or args.evaluate:
+        if not args.resume:
+            path = args.evaluate
+        else:
+            path = args.resume
+        parent_dir = os.path.dirname(path)
+        with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
+            runid = f.read().strip()
+    global run
+    run = wandb.init(
+        project="SOCOLA",
+        group="lincls",
+        config={
+            "architecture": args.arch,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "schedule": args.schedule,
+            "workers": args.workers,
+            "pretrained": args.pretrained,
+            "subset": args.subset,
+            "seed": args.seed,
+            "gpu": args.gpu,
+            "multiprocessing_distributed": args.multiprocessing_distributed,
+            "world_size": args.world_size,
+            "rank": args.rank,
+            "dist_url": args.dist_url,
+            "dist_backend": args.dist_backend,
+            "resume": args.resume,
+            "evaluate": args.evaluate,
+            "start_epoch": args.start_epoch,
+            "data": args.data
+        },
+        id=runid,
+        resume="allow",
+    )
+    wandb.define_metric("epochs")
+    wandb.define_metric("epochs/*", step_metric="epochs")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -190,7 +247,8 @@ def main():
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node,
+                 args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
@@ -227,7 +285,6 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = models.__dict__[args.arch]()
-
     # freeze all layers but the last fc
     for name, param in model.named_parameters():
         if name not in ["fc.weight", "fc.bias"]:
@@ -242,18 +299,20 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> loading checkpoint '{}'".format(args.pretrained))
             checkpoint = torch.load(args.pretrained, map_location="cpu")
 
+            # breakpoint()
             # rename moco pre-trained keys
             state_dict = checkpoint["state_dict"]
             for k in list(state_dict.keys()):
                 # retain only encoder_q up to before the embedding layer
-                if k.startswith("module.encoder_q") and not k.startswith(
-                    "module.encoder_q.fc"
+                if k.startswith("encoder_img") and not k.startswith(
+                    "encoder_img.fc"
                 ):
                     # remove prefix
-                    state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
+                    state_dict[k[len("encoder_img."):]] = state_dict[k]
                 # delete renamed or unused k
                 del state_dict[k]
 
+            # breakpoint()
             args.start_epoch = 0
             msg = model.load_state_dict(state_dict, strict=False)
             assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
@@ -273,36 +332,48 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            args.workers = int(
+                (args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(
                 model, device_ids=[args.gpu]
             )
+
+            # define loss function (criterion) and optimizer
+            criterion = nn.CrossEntropyLoss().cuda(args.gpu)
         else:
             model.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
+            criterion = nn.CrossEntropyLoss().cuda()
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        # define loss function (criterion) and optimizer
+        criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
-        if args.arch.startswith("alexnet") or args.arch.startswith("vgg"):
-            model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
+        # if args.arch.startswith("alexnet") or args.arch.startswith("vgg"):
+        #     model.features = torch.nn.DataParallel(model.features)
+        #     model.cuda()
+        # else:
+        #     model = torch.nn.DataParallel(model).cuda()
+        model = model.to(device)
+        criterion = nn.CrossEntropyLoss().to(device)
 
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
+    print(model)
     # optimize only the linear classifier
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     assert len(parameters) == 2  # fc.weight, fc.bias
-    optimizer = torch.optim.SGD(
-        parameters, args.lr, momentum=args.momentum, weight_decay=args.weight_decay
-    )
+    # optimizer = torch.optim.SGD(
+    #     parameters, args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+    # )
 
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        args.lr,
+        weight_decay=args.weight_decay,
+    )
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -331,8 +402,8 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, "train")
-    valdir = os.path.join(args.data, "val")
+    traindir = os.path.join(args.data, "ILSVRC/imagenet")
+    valdir = os.path.join(args.data, "ILSVRC/imagenet_val")
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
@@ -350,9 +421,15 @@ def main_worker(gpu, ngpus_per_node, args):
     )
 
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset)
     else:
         train_sampler = None
+
+    if args.subset < 1:
+        subset = int(len(train_dataset) * args.subset)
+        indices = torch.randperm(len(train_dataset))[:subset]
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -385,24 +462,45 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
+    # wandb.watch(model, log="all", log_freq=args.print_freq)
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train_log = train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
+        val_log = validate(val_loader, model, criterion, args)
+        acc1 = val_log["epochs/val-acc@1"]
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
+        wandb.log({**train_log, **val_log, "epochs": epoch})
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
+            pwd = os.getcwd()
+            directory = os.path.join(pwd, args.save_dir)
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+                if not args.resume:
+                    with open(os.path.join(directory, "runid.txt"), "w") as f:
+                        f.write(run.id)
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "arch": args.arch,
+                    "state_dict": model.state_dict(),
+                    "best_acc1": best_acc1,
+                    "optimizer": optimizer.state_dict(),
+                },
+                is_best=False,
+                filename=os.path.join(directory, "linear_checkpoint_{:04d}.pth.tar".format(epoch)),
+            )
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -412,6 +510,7 @@ def main_worker(gpu, ngpus_per_node, args):
                     "optimizer": optimizer.state_dict(),
                 },
                 is_best,
+                filename=os.path.join(directory, "linear_best_model.pth.tar".format(epoch)),
             )
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
@@ -436,16 +535,16 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     BatchNorm in train mode may revise running mean/std (even if it receives
     no gradient), which are part of the model parameters too.
     """
+    wandb.watch(model, log="all", log_freq=args.print_freq)
     model.eval()
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        # breakpoint()
+        images = images.to(device)
+        target = target.to(device)
 
         # compute output
         output = model(images)
@@ -468,9 +567,27 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "avg_loss": loss.item(),
+                    "acc@1": acc1[0].item(),
+                    "acc@5": acc5[0].item(),
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+                step=epoch * len(train_loader) + i,
+            )
+
+    return {
+        "epochs/train-avg_loss": losses.avg,
+        "epochs/train-acc@1": top1.avg,
+        "epochs/train-acc@5": top5.avg,
+        "epochs/train-lr": optimizer.param_groups[0]["lr"],
+    }
 
 
 def validate(val_loader, model, criterion, args):
+
     batch_time = AverageMeter("Time", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
@@ -485,10 +602,11 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
+            # if args.gpu is not None:
+            #     images = images.cuda(args.gpu, non_blocking=True)
+            # target = target.cuda(args.gpu, non_blocking=True)
+            images = images.to(device)
+            target = target.to(device)
             # compute output
             output = model(images)
             loss = criterion(output, target)
@@ -508,10 +626,15 @@ def validate(val_loader, model, criterion, args):
 
         # TODO: this should also be done with the ProgressMeter
         print(
-            " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(top1=top1, top5=top5)
+            " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(
+                top1=top1, top5=top5)
         )
 
-    return top1.avg
+    return {
+        "epochs/val-avg_loss": losses.avg,
+        "epochs/val-acc@1": top1.avg,
+        "epochs/val-acc@5": top5.avg,
+    }
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -536,9 +659,7 @@ def sanity_check(state_dict, pretrained_weights):
 
         # name in pretrained model
         k_pre = (
-            "module.encoder_q." + k[len("module.") :]
-            if k.startswith("module.")
-            else "module.encoder_q." + k
+            "encoder_img." + k
         )
 
         assert (
@@ -611,7 +732,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

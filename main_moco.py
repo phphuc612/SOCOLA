@@ -15,13 +15,10 @@ import random
 import shutil
 import time
 import warnings
+from tqdm import tqdm
+
 import numpy as np
-import wandb
-
-from dataset.coco import COCODataset
-
-import moco.builder
-import moco.loader
+import psutil
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -29,14 +26,19 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.parallel
 import torch.optim
+import torch.nn.functional as F
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
-import utils
-import psutil
 from PIL import Image
+
+import moco.builder
+import moco.loader
+import utils
+import wandb
+from dataset.coco import COCODataset
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger = logging.getLogger(__name__)
@@ -177,13 +179,18 @@ parser.add_argument(
 )
 parser.add_argument("--cos", action="store_true",
                     help="use cosine lr schedule")
-parser.add_argument("--subset", default=1, type=float, help="subset of data to use")
+parser.add_argument("--subset", default=1, type=float,
+                    help="subset of data to use")
 
 parser.add_argument("--save-dir", default=".", type=str, help="save directory")
 
-parser.add_argument("--eval-only", default="", help="path to checkpoint for evaluation only")
+parser.add_argument("--eval-only", default="",
+                    help="path to checkpoint for evaluation only")
+
+
 def main():
     args = parser.parse_args()
+    runid = None
     if args.resume or args.eval_only:
         if not args.resume:
             path = args.eval_only
@@ -192,10 +199,11 @@ def main():
         parent_dir = os.path.dirname(path)
         print("parend dir", parent_dir)
         with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
-            runid = f.read()
+            runid = f.read().strip()
     global run
     run = wandb.init(
         project="SOCOLA",
+        group="pretrain",
         config={
             "arch": args.arch,
             "temp": args.T,
@@ -223,7 +231,7 @@ def main():
         resume="allow",
     )
     wandb.define_metric("epochs")
-    wandb.define_metric("epoch/*", step_metric="epochs")
+    wandb.define_metric("epochs/*", step_metric="epochs")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -401,20 +409,27 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]
-    if not args.eval_only:
-        train_dataset = datasets.ImageFolder(
-            os.path.join(datadir, "ILSVRC/imagenet"),
-            moco.loader.TwoCropsTransform(
-                transforms.Compose(augmentation)
-            ),
-        )
-    val_dataset = datasets.ImageFolder(
-        os.path.join(datadir, "ILSVRC/imagenet_val"),
+    train_dataset = datasets.ImageFolder(
+        os.path.join(datadir, "ILSVRC/imagenet"),
         moco.loader.TwoCropsTransform(
             transforms.Compose(augmentation)
         ),
     )
-    if args.subset < 1 and not args.eval_only:
+    val_dataset = datasets.ImageFolder(
+        os.path.join(datadir, "ILSVRC/imagenet_val"),
+        transform=transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        ),
+    )
+
+    class_index = None
+    if args.subset < 1:
+        class_index = train_dataset.classes
         subset = int(len(train_dataset) * args.subset)
         indices = torch.randperm(len(train_dataset))[:subset]
         train_dataset = torch.utils.data.Subset(train_dataset, indices)
@@ -432,42 +447,57 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         train_sampler = None
     print("distrbitued", args.distributed)
-    if not args.eval_only:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=(train_sampler is None),
-            num_workers=args.workers,
-            pin_memory=True,
-            sampler=train_sampler,
-            drop_last=True,
-        )
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=train_sampler,
+        drop_last=True,
+    )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.workers,
         pin_memory=True,
-        drop_last=True,
     )
-    
+    if args.eval_only:
+        print("evaluating")
+        img_encoder = model.encoder_img
+        # eval_output = evaluate(val_loader, model, args.start_epoch, device, args)
+        # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
+        knn = kNN(args, args.start_epoch, model.encoder_img, train_loader, val_loader, 200, 0.07, class_index=class_index)
+        knn = {f"epochs/knn-{k}": v for k, v in knn.items()}
+        wandb.log({**knn, "epochs": args.start_epoch})
+        return 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        wandb_log_output = {"epochs": epoch} # log epoch
-        if not args.eval_only:
-            adjust_learning_rate(optimizer, epoch, args)
+        wandb_log_output = {"epochs": epoch}  # log epoch
+    
+        adjust_learning_rate(optimizer, epoch, args)
 
-            # train for one epoch
-            train_output = train(train_loader, model, optimizer, epoch, device, args)
-            train_output = {f"epoch/train-{k}": v for k, v in train_output.items()}
-            wandb_log_output.update(train_output)
+        # train for one epoch
+        train_output = train(train_loader, model,
+                                optimizer, epoch, device, args)
+        train_output = {f"epochs/train-{k}": v for k,
+                        v in train_output.items()}
+        wandb_log_output.update(train_output)
 
-        eval_output = evaluate(val_loader, model, epoch, device, args)
-        eval_output = {f"epoch/eval-{k}": v for k, v in eval_output.items()}
-        print(eval_output)
-        wandb_log_output.update(eval_output)
+        # eval_output = evaluate(val_loader, model, epoch, device, args)
+        # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
+        # wandb_log_output.update(eval_output)
+
+        # img_encoder = model.encoder_img
+
+        # # kNN monitor
+        # kNN_output = kNN(args, epoch, img_encoder, train_loader, val_loader, 200, 0.07)
+        # knn_output = {f"epochs/knn-{k}": v for k, v in kNN_output.items()}
+        # wandb_log_output.update(knn_output)
         wandb.log(wandb_log_output)
 
         if not args.eval_only and not args.multiprocessing_distributed or (
@@ -487,7 +517,8 @@ def main_worker(gpu, ngpus_per_node, args):
                     "optimizer": optimizer.state_dict(),
                 },
                 is_best=False,
-                filename=os.path.join(directory, "checkpoint_{:04d}.pth.tar".format(epoch)),
+                filename=os.path.join(
+                    directory, "checkpoint_{:04d}.pth.tar".format(epoch)),
             )
 
 
@@ -521,14 +552,12 @@ def train(
         data_loader.sampler.set_epoch(epoch)
     print(len(data_loader))
 
-
-    
     for iteration_cnt, (imgs, _) in enumerate(
         metric_logger.log_every(data_loader, print_freq, logger, header)
     ):
         # logger.info(f"ram: {int(np.round(psutil.virtual_memory()[3] / (1000. **3))) }")  # total physical memory in Bytes
         optimizer.zero_grad(set_to_none=True)
-        
+
         query_img = imgs[0].to(device)
         key_img = imgs[1].to(device)
         avg_loss, logits, labels = model(query_img, key_img, device)
@@ -554,10 +583,15 @@ def train(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info(f"Averaged stats: {metric_logger.global_avg()}")
+
+    # Encode the whole training set and store them into the memory bank
+    # with torch.no_grad():
+
     return {
         k: meter.global_avg
         for k, meter in metric_logger.meters.items()
     }
+
 
 def evaluate(
     data_loader,
@@ -582,9 +616,8 @@ def evaluate(
         data_loader.sampler.set_epoch(epoch)
     print(len(data_loader))
 
-
     with torch.no_grad():
-        for _, (imgs, _) in enumerate(data_loader):            
+        for _, (imgs, _) in enumerate(data_loader):
             query_img = imgs[0].to(device)
             key_img = imgs[1].to(device)
             avg_loss, logits, labels = model(query_img, key_img, device)
@@ -598,6 +631,141 @@ def evaluate(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info(f"Averaged stats: {metric_logger.global_avg()}")
+    return {
+        k: meter.global_avg
+        for k, meter in metric_logger.meters.items()
+    }
+
+
+
+def kNN(args, epoch, model, trainloader, testloader, K, sigma, class_index=None):
+    """
+    model: a vision model, like resnet
+    """
+
+    # TODO: lemniscate -> trainFeature bank, after complete one training epoch, encode the whole training set 
+    # and store the features in the bank, then use the bank to do kNN
+
+    model.eval()
+    # model_time = AverageMeter()
+    # cls_time = AverageMeter()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter(
+        "model_time", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
+    )
+    metric_logger.add_meter(
+        "cls_time", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
+    )
+    metric_logger.add_meter(
+        "top1", utils.SmoothedValue(window_size=50, fmt="{value:.2f}")
+    )
+    metric_logger.add_meter(
+        "top5", utils.SmoothedValue(window_size=50, fmt="{value:.2f}")
+    )
+
+    header = "Test Epoch: [{}]".format(epoch)
+
+    total = 0
+    testsize = testloader.dataset.__len__()
+
+    # trainFeatures = lemniscate.memory.t()
+    # if hasattr(trainloader.dataset, 'imgs'):
+    #     trainLabels = torch.LongTensor([y for (p, y) in trainloader.dataset.imgs]).cuda()
+    # else:
+    #     trainLabels = torch.LongTensor(trainloader.dataset.train_labels).cuda()
+    # C = trainLabels.max() + 1
+
+    # if recompute_memory:
+    #     transform_bak = trainloader.dataset.transform
+    #     trainloader.dataset.transform = testloader.dataset.transform
+    #     temploader = torch.utils.data.DataLoader(trainloader.dataset, batch_size=100, shuffle=False, num_workers=1)
+    #     for batch_idx, (inputs, targets, indexes) in enumerate(temploader):
+    #         targets = targets.cuda(async=True)
+    #         batchSize = inputs.size(0)
+    #         features = model(inputs)
+    #         trainFeatures[:, batch_idx*batchSize:batch_idx*batchSize+batchSize] = features.data.t()
+    #     trainLabels = torch.LongTensor(temploader.dataset.train_labels).cuda()
+    #     trainloader.dataset.transform = transform_bak
+    train_features = []
+    train_labels = []
+    C = None
+    if hasattr(trainloader.dataset, 'classes'):
+        C = len(trainloader.dataset.classes)
+    elif class_index is not None:
+        C = len(class_index)
+
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(tqdm(trainloader, desc="Encoding training set")):
+            chosen_image = random.choice(images)         
+            chosen_image = chosen_image.to(device)
+            labels = labels.to(device)
+            
+            # random choose 1 from 2 image in images
+            feature = model(chosen_image)
+            train_features.append(feature.detach())
+            train_labels.append(labels)
+
+    train_features = torch.concat(train_features, dim=0)
+    train_labels = torch.concat(train_labels, dim=0)
+    train_features = train_features.to(device)
+    train_labels = train_labels.to(device)
+
+    # normalize the features?
+    train_features = F.normalize(train_features, dim=1)
+    top1 = 0.
+    top5 = 0.
+    end = time.time()
+    with torch.no_grad():
+        retrieval_one_hot = torch.zeros(K, C).to(device)
+        for batch_idx, (inputs, targets) in enumerate(
+            metric_logger.log_every(testloader, args.print_freq, logger, header)
+        ):
+            end = time.time()
+            targets = targets.to(device)
+            inputs = inputs.to(device)
+            batchSize = inputs.size(0)
+            features = model(inputs)
+            
+            # normalize the features?
+            features = F.normalize(features, dim=1)
+
+            metric_logger.update(model_time=time.time() - end)
+            # model_time.update(time.time() - end)
+            end = time.time()
+
+            # dist = torch.mm(features, train_features) # D x C, N x C -> D x N
+            dist = features @ train_features.t() # bs x D, D x N -> bs x N
+
+            yd, yi = dist.topk(K, dim=1, largest=True, sorted=True)
+            candidates = train_labels.view(1,-1).expand(batchSize, -1)
+            retrieval = torch.gather(candidates, 1, yi)
+
+            retrieval_one_hot.resize_(batchSize * K, C).zero_()
+            retrieval_one_hot.scatter_(1, retrieval.view(-1, 1), 1)
+            yd_transform = yd.clone().div_(sigma).exp_()
+            probs = torch.sum(torch.mul(retrieval_one_hot.view(batchSize, -1 , C), yd_transform.view(batchSize, -1, 1)), 1)
+            _, predictions = probs.sort(1, True)
+
+            # Find which predictions match the target
+            correct = predictions.eq(targets.data.view(-1,1))
+            metric_logger.update(cls_time=time.time() - end)
+            # cls_time.update(time.time() - end)
+            
+            top1 = top1 + correct.narrow(1,0,1).sum().item()
+            top5 = top5 + correct.narrow(1,0,5).sum().item()
+
+            total += targets.size(0)
+            metric_logger.update(top1=top1 * 100. / total)
+            metric_logger.update(top5=top5 * 100. / total)
+            # print('Test [{}/{}]\t'
+            #       'model Time {model_time.val:.3f} ({model_time.avg:.3f})\t'
+            #       'Cls Time {cls_time.val:.3f} ({cls_time.avg:.3f})\t'
+            #       'Top1: {:.2f}  Top5: {:.2f}'.format(
+            #       total, testsize, top1*100./total, top5*100./total, model_time=model_time, cls_time=cls_time))
+
+    # print(epoch, top1*100./total)
+
+    # return {"top1": top1 * 100. /total, "top5": top5 * 100. /total, "epochs": epoch}
     return {
         k: meter.global_avg
         for k, meter in metric_logger.meters.items()
@@ -670,8 +838,8 @@ def accuracy(output, target, topk=(1,)):
         batch_size = target.size(0)
 
         _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t() # N x maxk -> maxk x N
-        correct = pred.eq(target.view(1, -1).expand_as(pred)) # maxk x N
+        pred = pred.t()  # N x maxk -> maxk x N
+        correct = pred.eq(target.view(1, -1).expand_as(pred))  # maxk x N
 
         res = []
         for k in topk:
