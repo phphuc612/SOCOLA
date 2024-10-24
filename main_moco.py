@@ -507,8 +507,9 @@ def main_worker(gpu, ngpus_per_node, args):
             directory = os.path.join(pwd, args.save_dir)
             if not os.path.exists(directory):
                 os.makedirs(directory)
-                with open(os.path.join(directory, "runid.txt"), "w") as f:
-                    f.write(run.id)
+                if not args.resume:
+                    with open(os.path.join(directory, "runid.txt"), "w") as f:
+                        f.write(run.id)
             save_checkpoint(
                 {
                     "epoch": epoch + 1,

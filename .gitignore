@@ -380,12 +380,13 @@ android/pytorch_android_torchvision/.cxx
 # Data folder
 data/
 ckpts/
+ckpts*/
 cache/
 data_tmp/
 playgrounds/
 wandb/
 data
-# Log filer
+# Log filter
 log*.txt
 configs/envs.py
 
