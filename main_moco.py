@@ -29,9 +29,10 @@ import torch.optim
 import torch.nn.functional as F
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.datasets as datasets
-import torchvision.models as models
-import torchvision.transforms as transforms
+# import torchvision.datasets as datasets
+# import torchvision.models as models
+# import torchvision.transforms as transforms
+from torchvision import datasets, models, transforms
 from PIL import Image
 
 import moco.builder
@@ -187,7 +188,9 @@ parser.add_argument("--save-dir", default=".", type=str, help="save directory")
 parser.add_argument("--eval-only", default="",
                     help="path to checkpoint for evaluation only")
 
-
+parser.add_argument("--run-name", default="", help="run name for wandb")
+parser.add_argument("--debug", action="store_true", help="debug mode")
+parser.add_argument("--model-type", default="cnn", help="cnn/transformers architecture")
 def main():
     args = parser.parse_args()
     runid = None
@@ -201,37 +204,39 @@ def main():
         with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
             runid = f.read().strip()
     global run
-    run = wandb.init(
-        project="SOCOLA",
-        group="pretrain",
-        config={
-            "arch": args.arch,
-            "temp": args.T,
-            "dim": args.dim,
-            "sub_batch_size": args.sub_batch_size,
-            "lr": args.lr,
-            "cos": args.cos,
-            "batch_size": args.batch_size,
-            "epochs": args.epochs,
-            "weight_decay": args.weight_decay,
-            "workers": args.workers,
-            "seed": args.seed,
-            "world_size": args.world_size,
-            "rank": args.rank,
-            "dist_url": args.dist_url,
-            "dist_backend": args.dist_backend,
-            "gpu": args.gpu,
-            "multiprocessing_distributed": args.multiprocessing_distributed,
-            "schedule": args.schedule,
-            "aug_plus": args.aug_plus,
-            "mlp": args.mlp,
-            "subset": args.subset,
-        },
-        id=runid,
-        resume="allow",
-    )
-    wandb.define_metric("epochs")
-    wandb.define_metric("epochs/*", step_metric="epochs")
+    if not args.debug:
+        run = wandb.init(
+            project="SOCOLA",
+            group="pretrain" if not args.eval_only else "knn",
+            name=args.run_name,
+            config={
+                "arch": args.arch,
+                "temp": args.T,
+                "dim": args.dim,
+                "sub_batch_size": args.sub_batch_size,
+                "lr": args.lr,
+                "cos": args.cos,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "weight_decay": args.weight_decay,
+                "workers": args.workers,
+                "seed": args.seed,
+                "world_size": args.world_size,
+                "rank": args.rank,
+                "dist_url": args.dist_url,
+                "dist_backend": args.dist_backend,
+                "gpu": args.gpu,
+                "multiprocessing_distributed": args.multiprocessing_distributed,
+                "schedule": args.schedule,
+                "aug_plus": args.aug_plus,
+                "mlp": args.mlp,
+                "subset": args.subset,
+            },
+            id=runid,
+            resume="allow",
+        )
+        wandb.define_metric("epochs")
+        wandb.define_metric("epochs/*", step_metric="epochs")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -304,6 +309,7 @@ def main_worker(gpu, ngpus_per_node, args):
         args.dim,
         args.T,
         args.mlp,
+        args.model_type,
     )
     print(model)
     criterion = None
@@ -446,7 +452,7 @@ def main_worker(gpu, ngpus_per_node, args):
             train_dataset)
     else:
         train_sampler = None
-    print("distrbitued", args.distributed)
+    print("distributed", args.distributed)
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -469,9 +475,10 @@ def main_worker(gpu, ngpus_per_node, args):
         img_encoder = model.encoder_img
         # eval_output = evaluate(val_loader, model, args.start_epoch, device, args)
         # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
-        knn = kNN(args, args.start_epoch, model.encoder_img, train_loader, val_loader, 200, 0.07, class_index=class_index)
+        knn = kNN(args, args.start_epoch, img_encoder, train_loader, val_loader, 200, 0.07, class_index=class_index)
         knn = {f"epochs/knn-{k}": v for k, v in knn.items()}
-        wandb.log({**knn, "epochs": args.start_epoch})
+        if not args.debug:
+            wandb.log({**knn, "epochs": args.start_epoch})
         return 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -487,7 +494,8 @@ def main_worker(gpu, ngpus_per_node, args):
         train_output = {f"epochs/train-{k}": v for k,
                         v in train_output.items()}
         wandb_log_output.update(train_output)
-
+        if not args.debug:
+            wandb.log(wandb_log_output)
         # eval_output = evaluate(val_loader, model, epoch, device, args)
         # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
         # wandb_log_output.update(eval_output)
@@ -498,7 +506,6 @@ def main_worker(gpu, ngpus_per_node, args):
         # kNN_output = kNN(args, epoch, img_encoder, train_loader, val_loader, 200, 0.07)
         # knn_output = {f"epochs/knn-{k}": v for k, v in kNN_output.items()}
         # wandb_log_output.update(knn_output)
-        wandb.log(wandb_log_output)
 
         if not args.eval_only and not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
@@ -532,7 +539,8 @@ def train(
     args,
 ):
     # train
-    wandb.watch(model, log="all", log_freq=20)
+    if not args.debug:
+        wandb.watch(model, log="all", log_freq=20)
     model.train()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -571,7 +579,7 @@ def train(
         metric_logger.update(temp=model.T.item())
         metric_logger.update(acc1=acc1[0].item())
         metric_logger.update(acc5=acc5[0].item())
-        if iteration_cnt % print_freq == 0:
+        if iteration_cnt % print_freq == 0 and not args.debug:
             wandb.log({
                 "epoch": epoch,
                 "avg_loss": avg_loss,

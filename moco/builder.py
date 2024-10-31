@@ -16,7 +16,7 @@ class MoCo(nn.Module):
     https://arxiv.org/abs/1911.05722
     """
 
-    def __init__(self, base_encoder, sub_batch_size, dim=128, T=0.07, mlp=False):
+    def __init__(self, base_encoder, sub_batch_size, dim=128, T=0.07, mlp=False, model_type="cnn"):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -31,14 +31,22 @@ class MoCo(nn.Module):
         self.T = nn.Parameter(
             torch.ones([]) * T
         )
+        self.model_type = model_type
         # create the encoders
         # num_classes is the output fc dimension
         self.encoder_img = base_encoder(num_classes=dim)
         if mlp:
-            dim_mlp = self.encoder_img.fc.weight.shape[1]
-            self.encoder_img.fc = nn.Sequential(
-                nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_img.fc
-            )
+            if self.model_type == "cnn":
+                dim_mlp = self.encoder_img.fc.weight.shape[1]
+                self.encoder_img.fc = nn.Sequential(
+                    nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_img.fc
+                )
+            else:
+                dim_mlp = self.encoder_img.heads.head.weight.shape[1]
+                self.encoder_img.heads = nn.Sequential(
+                    nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_img.heads.head
+                )
+                nn.init.xavier_normal_(self.encoder_img.heads[2].weight)
 
     def forward(self, all_query_imgs, all_key_imgs, device):
         """
@@ -57,7 +65,7 @@ class MoCo(nn.Module):
                 key_img_embeds.append(self.encoder_img(key_imgs))  # keys: NxC
             key_img_embeds = torch.concat(key_img_embeds)
             key_img_embeds = F.normalize(key_img_embeds, dim=1)
-
+        
             shuffled_idx = torch.randperm(all_query_imgs.shape[0])
             key_img_embeds = key_img_embeds[shuffled_idx]
 
