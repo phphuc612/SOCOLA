@@ -8,6 +8,6 @@ python main_socola_final_no_temp.py --arch resnet50 \
                     --mlp \
                     --aug-plus \
                     --subset 1 \
-                    --save-dir "ckpts-socola-final-rn50" \
-                    --run-name "socola-final-resnet50" \
+                    --save-dir "ckpts-socola-final-no-temp-rn50" \
+                    --run-name "socola-final-no-temp-resnet50" \
                     "/mnt/nvme0n1p2/CVPR"
