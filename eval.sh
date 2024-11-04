@@ -1,4 +1,4 @@
-for i in 20 25 29
+for i in 29
 do
 python main_moco.py --arch resnet50 \
                     --lr 0.005 \
@@ -11,6 +11,6 @@ python main_moco.py --arch resnet50 \
                     --mlp \
                     --aug-plus \
                     --subset 1 \
-                    --eval-only "/mnt/nvme0n1p2/Moco-MAC/SOCOLAClone/ckpts/default/checkpoint_$(printf "%04d" $i).pth.tar" \
+                    --eval-only "/mnt/nvme0n1p2/Moco-MAC/SOCOLAClone/ckpts-shuffle/checkpoint_$(printf "%04d" $i).pth.tar" \
                     "/mnt/nvme0n1p2/CVPR"
 done
