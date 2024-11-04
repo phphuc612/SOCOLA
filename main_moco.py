@@ -559,7 +559,6 @@ def train(
         metric_logger.log_every(data_loader, print_freq, logger, header)
     ):
         print_percent = args.print_freq
-        print_freq = print_percent * len(data_loader)
         # logger.info(f"ram: {int(np.round(psutil.virtual_memory()[3] / (1000. **3))) }")  # total physical memory in Bytes
         optimizer.zero_grad(set_to_none=True)
 
