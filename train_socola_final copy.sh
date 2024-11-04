@@ -1,4 +1,4 @@
-python main_socola_final.py --arch resnet50 \
+python main_socola_final_no_temp.py --arch resnet50 \
                     --seed 42 \
                     --lr 0.005 \
                     --batch-size 1024 \
