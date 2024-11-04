@@ -10,7 +10,7 @@ import argparse
 import builtins
 import logging
 import math
-import os
+import os, copy
 import random
 import shutil
 import time
@@ -29,17 +29,26 @@ import torch.optim
 import torch.nn.functional as F
 import torch.utils.data
 import torch.utils.data.distributed
-# import torchvision.datasets as datasets
-# import torchvision.models as models
-# import torchvision.transforms as transforms
 from torchvision import datasets, models, transforms
 from PIL import Image
 
 import moco.builder
 import moco.loader
+
+# dual_branch
+# from moco.dual_branch_update_net import End2End
+from moco.end2end_fix import End2End
+
+# gradcache
+from grad_cache import GradCache
+from grad_cache.loss import SimpleContrastiveLoss
+
 import utils
 import wandb
 from dataset.coco import COCODataset
+
+# ordered dict
+from collections import OrderedDict
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger = logging.getLogger(__name__)
@@ -175,7 +184,6 @@ parser.add_argument(
 )
 # options for moco v2
 parser.add_argument("--mlp", action="store_true", help="use mlp head")
-parser.add_argument("--mlp_dim", default=4096, type=int, help="mlp head dimension")
 parser.add_argument(
     "--aug-plus", action="store_true", help="use moco v2 data augmentation"
 )
@@ -189,8 +197,32 @@ parser.add_argument("--save-dir", default=".", type=str, help="save directory")
 parser.add_argument("--eval-only", default="",
                     help="path to checkpoint for evaluation only")
 
-parser.add_argument("--run-name", default="", help="run name for wandb")
-parser.add_argument("--debug", action="store_true", help="debug mode")
+parser.add_argument("--resume-optimizer", action="store_true",
+                    help="resume optimizer from checkpoint")
+
+
+def load_state_dict_end2end(model: nn.Module, state_dict: dict) -> nn.Module:
+    """
+    The original model is saved with "encoder_img" in name.
+    The targeted model is intended to be loaded under two branches: "query_encoder" and "key_encoder"
+    So, we need to remove the "encoder_img" in the state_dict keys. Then, we can load the state_dict to each branch.
+    """
+    # create new OrderedDict that does not contain `module.`
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        if k.startswith("encoder_img."):
+            name = k[12:]
+            new_state_dict[f"query_encoder.{name}"] = copy.deepcopy(v)
+            new_state_dict[f"key_encoder.{name}"] = copy.deepcopy(v)
+        else:
+            new_state_dict[k] = v
+    model.load_state_dict(new_state_dict)
+    print("Custom load state dict ran successfully!...")
+    return model
+
+
+
+
 def main():
     args = parser.parse_args()
     runid = None
@@ -204,39 +236,37 @@ def main():
         with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
             runid = f.read().strip()
     global run
-    if not args.debug:
-        run = wandb.init(
-            project="SOCOLA",
-            group="final-pretrain" if not args.eval_only else "knn",
-            name=args.run_name,
-            config={
-                "arch": args.arch,
-                "temp": args.T,
-                "dim": args.dim,
-                "sub_batch_size": args.sub_batch_size,
-                "lr": args.lr,
-                "cos": args.cos,
-                "batch_size": args.batch_size,
-                "epochs": args.epochs,
-                "weight_decay": args.weight_decay,
-                "workers": args.workers,
-                "seed": args.seed,
-                "world_size": args.world_size,
-                "rank": args.rank,
-                "dist_url": args.dist_url,
-                "dist_backend": args.dist_backend,
-                "gpu": args.gpu,
-                "multiprocessing_distributed": args.multiprocessing_distributed,
-                "schedule": args.schedule,
-                "aug_plus": args.aug_plus,
-                "mlp": args.mlp,
-                "subset": args.subset,
-            },
-            id=runid,
-            resume="allow",
-        )
-        wandb.define_metric("epochs")
-        wandb.define_metric("epochs/*", step_metric="epochs")
+    run = wandb.init(
+        project="SOCOLA",
+        group="nghich_dual_branch_pretrain",
+        config={
+            "arch": args.arch,
+            "temp": args.T,
+            "dim": args.dim,
+            "sub_batch_size": args.sub_batch_size,
+            "lr": args.lr,
+            "cos": args.cos,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "weight_decay": args.weight_decay,
+            "workers": args.workers,
+            "seed": args.seed,
+            "world_size": args.world_size,
+            "rank": args.rank,
+            "dist_url": args.dist_url,
+            "dist_backend": args.dist_backend,
+            "gpu": args.gpu,
+            "multiprocessing_distributed": args.multiprocessing_distributed,
+            "schedule": args.schedule,
+            "aug_plus": args.aug_plus,
+            "mlp": args.mlp,
+            "subset": args.subset,
+        },
+        id=runid,
+        resume="allow",
+    )
+    wandb.define_metric("epochs")
+    wandb.define_metric("epochs/*", step_metric="epochs")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -301,24 +331,18 @@ def main_worker(gpu, ngpus_per_node, args):
             world_size=args.world_size,
             rank=args.rank,
         )
-    # create model
+    
+    ### Start of model creation and loading pretrained weights
     print("=> creating model '{}'".format(args.arch))
-    if args.arch.startswith("vit"):
-        model = moco.builder.SOCOLA_ViT(
-            models.__dict__[args.arch],
-            args.sub_batch_size,
-            args.dim,
-            args.mlp_dim,
-            args.T,
-        )
-    else:
-        model = moco.builder.SOCOLA_Resnet(
-            models.__dict__[args.arch],
-            args.sub_batch_size,
-            args.dim,
-            args.mlp_dim,
-            args.T,
-        )
+    
+    model = End2End(
+        models.__dict__[args.arch],
+        args.sub_batch_size,
+        args.dim,
+        args.T,
+        args.mlp,
+    )
+
     print(model)
     criterion = None
     if args.distributed:
@@ -368,14 +392,19 @@ def main_worker(gpu, ngpus_per_node, args):
                 # Map model to be loaded to specified single gpu.
                 loc = "cuda:{}".format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint["epoch"]
-            model.load_state_dict(checkpoint["state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            print(
-                "=> loaded checkpoint '{}' (epoch {})".format(
-                    args.resume, checkpoint["epoch"]
+            # model.load_state_dict(checkpoint["state_dict"])
+            model = load_state_dict_end2end(model, checkpoint["state_dict"])
+            # import pdb; pdb.set_trace()
+            if args.resume_optimizer:
+                args.start_epoch = checkpoint["epoch"]
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print(
+                    "=> loaded checkpoint '{}' (epoch {})".format(
+                        args.resume, checkpoint["epoch"]
+                    )
                 )
-            )
+            else:
+                args.start_epoch = 0
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
     elif args.eval_only:
@@ -392,6 +421,8 @@ def main_worker(gpu, ngpus_per_node, args):
             args.epochs = args.start_epoch + 1
             print("=> loaded checkpoint '{}'".format(args.eval_only))
     cudnn.benchmark = True
+
+    ### End of model creation and loading pretrained weights
 
     # Data loading code
     datadir = args.data
@@ -478,15 +509,15 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers,
         pin_memory=True,
     )
+    # @TODO hasn't fixed yet
     if args.eval_only:
         print("evaluating")
         img_encoder = model.encoder_img
         # eval_output = evaluate(val_loader, model, args.start_epoch, device, args)
         # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
-        knn = kNN(args, args.start_epoch, img_encoder, train_loader, val_loader, 200, 0.07, class_index=class_index)
+        knn = kNN(args, args.start_epoch, model.encoder_img, train_loader, val_loader, 200, 0.07, class_index=class_index)
         knn = {f"epochs/knn-{k}": v for k, v in knn.items()}
-        if not args.debug:
-            wandb.log({**knn, "epochs": args.start_epoch})
+        wandb.log({**knn, "epochs": args.start_epoch})
         return 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -497,13 +528,22 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train_output = train(train_loader, model,
-                                optimizer, epoch, device, args)
+        train_output = train(train_loader, model, optimizer, epoch, device, args)
         train_output = {f"epochs/train-{k}": v for k,
                         v in train_output.items()}
         wandb_log_output.update(train_output)
-        if not args.debug:
-            wandb.log(wandb_log_output)
+
+        # eval_output = evaluate(val_loader, model, epoch, device, args)
+        # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
+        # wandb_log_output.update(eval_output)
+
+        # img_encoder = model.encoder_img
+
+        # # kNN monitor
+        # kNN_output = kNN(args, epoch, img_encoder, train_loader, val_loader, 200, 0.07)
+        # knn_output = {f"epochs/knn-{k}": v for k, v in kNN_output.items()}
+        # wandb_log_output.update(knn_output)
+        wandb.log(wandb_log_output)
 
         if not args.eval_only and not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
@@ -537,9 +577,15 @@ def train(
     args,
 ):
     # train
-    if not args.debug:
-        wandb.watch(model, log="all", log_freq=20)
+    wandb.watch(model, log="all", log_freq=20)
     model.train()
+    model.to(device)
+
+    gc = GradCache(
+        models = [model.query_encoder, model.key_encoder],
+        chunk_sizes=4,
+        loss_fn=SimpleContrastiveLoss(),
+    )
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter(
@@ -557,7 +603,7 @@ def train(
 
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
-    print(len(data_loader))
+    print(f"{len(data_loader)=}")
 
     for iteration_cnt, (imgs, _) in enumerate(
         metric_logger.log_every(data_loader, print_freq, logger, header)
@@ -567,24 +613,29 @@ def train(
 
         query_img = imgs[0].to(device)
         key_img = imgs[1].to(device)
-        avg_loss, logits, labels = model(query_img, key_img, device)
 
-        acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
+        # Forward pass  
+        # ---
+        # avg_loss, logits, labels = model(query_img, key_img, device)
+        avg_loss = gc(query_img, key_img, reduction="mean")
+        # avg_loss = F.cross_entropy(logits, labels, reduction="mean")
+
+        # acc1, acc5 = accuracy(logits, labels, topk=(1, 5))
         optimizer.step()
 
         metric_logger.update(avg_loss=avg_loss)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(temp=model.T.item())
-        metric_logger.update(acc1=acc1[0].item())
-        metric_logger.update(acc5=acc5[0].item())
-        if iteration_cnt % print_freq == 0 and not args.debug:
+        # metric_logger.update(acc1=acc1[0].item())
+        # metric_logger.update(acc5=acc5[0].item())
+        if iteration_cnt % print_freq == 0:
             wandb.log({
                 "epoch": epoch,
                 "avg_loss": avg_loss,
                 "lr": optimizer.param_groups[0]["lr"],
                 "temp": model.T.item(),
-                "acc1": acc1[0].item(),
-                "acc5": acc5[0].item(),
+                # "acc1": acc1[0].item(),
+                # "acc5": acc5[0].item(),
             }, step=int(iteration_cnt / len(data_loader) * 100) + epoch * 100)
 
     # gather the stats from all processes

@@ -213,7 +213,7 @@ def main():
     if not args.debug:
         run = wandb.init(
             project="SOCOLA",
-            group="pretrain" if not args.eval_only else "knn",
+            group="final-pretrain" if not args.eval_only else "knn",
             name=args.run_name,
             config={
                 "arch": args.arch,
@@ -549,7 +549,7 @@ def train(
     )
 
     header = "Train Epoch: [{}]".format(epoch)
-    print_freq = 20
+    print_freq = args.print_freq
 
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
@@ -558,6 +558,8 @@ def train(
     for iteration_cnt, (imgs, _) in enumerate(
         metric_logger.log_every(data_loader, print_freq, logger, header)
     ):
+        print_percent = args.print_freq
+        print_freq = print_percent * len(data_loader)
         # logger.info(f"ram: {int(np.round(psutil.virtual_memory()[3] / (1000. **3))) }")  # total physical memory in Bytes
         optimizer.zero_grad(set_to_none=True)
 
@@ -580,7 +582,9 @@ def train(
                 "lr": optimizer.param_groups[0]["lr"],
                 "acc1": acc1[0].item(),
                 "acc5": acc5[0].item(),
-            }, step=epoch * len(data_loader) + iteration_cnt)
+            }, 
+            step=int(iteration_cnt / len(data_loader) * 100) + epoch * 100
+            )
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -612,7 +616,7 @@ def evaluate(
     )
 
     header = "Eval Epoch: [{}]".format(epoch)
-    print_freq = 20
+    print_freq = args.print_freq
 
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)

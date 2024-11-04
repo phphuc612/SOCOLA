@@ -35,7 +35,7 @@ import torch.utils.data.distributed
 from torchvision import datasets, models, transforms
 from PIL import Image
 
-import moco.builder
+import moco.socola_final
 import moco.loader
 import utils
 import wandb
@@ -120,7 +120,7 @@ parser.add_argument(
 parser.add_argument(
     "-p",
     "--print-freq",
-    default=10,
+    default=20,
     type=int,
     metavar="N",
     help="print frequency (default: 10)",
@@ -304,7 +304,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     if args.arch.startswith("vit"):
-        model = moco.builder.SOCOLA_ViT(
+        model = moco.socola_final.SOCOLA_ViT(
             models.__dict__[args.arch],
             args.sub_batch_size,
             args.dim,
@@ -312,7 +312,7 @@ def main_worker(gpu, ngpus_per_node, args):
             args.T,
         )
     else:
-        model = moco.builder.SOCOLA_Resnet(
+        model = moco.socola_final.SOCOLA_Resnet(
             models.__dict__[args.arch],
             args.sub_batch_size,
             args.dim,
@@ -492,7 +492,6 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        wandb_log_output = {"epochs": epoch}  # log epoch
     
         adjust_learning_rate(optimizer, epoch, args)
 
@@ -501,9 +500,19 @@ def main_worker(gpu, ngpus_per_node, args):
                                 optimizer, epoch, device, args)
         train_output = {f"epochs/train-{k}": v for k,
                         v in train_output.items()}
-        wandb_log_output.update(train_output)
+        wandb_log_output = {"epochs": epoch, **train_output}
         if not args.debug:
             wandb.log(wandb_log_output)
+        # eval_output = evaluate(val_loader, model, epoch, device, args)
+        # eval_output = {f"epochs/eval-{k}": v for k, v in eval_output.items()}
+        # wandb_log_output.update(eval_output)
+
+        # img_encoder = model.encoder_img
+
+        # # kNN monitor
+        # kNN_output = kNN(args, epoch, img_encoder, train_loader, val_loader, 200, 0.07)
+        # knn_output = {f"epochs/knn-{k}": v for k, v in kNN_output.items()}
+        # wandb_log_output.update(knn_output)
 
         if not args.eval_only and not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
@@ -554,7 +563,6 @@ def train(
 
     header = "Train Epoch: [{}]".format(epoch)
     print_freq = args.print_freq
-
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
     print(len(data_loader))

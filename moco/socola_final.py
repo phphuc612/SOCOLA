@@ -56,7 +56,6 @@ class SOCOLA(nn.Module):
         Output:
             loss, logits, labels
         """
-        breakpoint()
         batch_size = all_query_imgs.shape[0]
         all_imgs = torch.concat([all_query_imgs, all_key_imgs], dim=0)
         sub_imgs = torch.split(all_imgs, self.sub_batch_size)
@@ -83,9 +82,8 @@ class SOCOLA(nn.Module):
             ))
             for i in range(0, batch_size):
                 true_labels[i], true_labels[i+batch_size] = (
-                    true_labels[i+batch_size], true_labels[i]
+                    true_labels[i+batch_size].item(), true_labels[i].item()
                 )
-            breakpoint()
             false_labels = false_labels.numpy().tolist()
             true_labels = true_labels.to(device)
             
@@ -102,7 +100,8 @@ class SOCOLA(nn.Module):
             # breakpoint()
             # compute similarities
             sim = query_img_embeds @ key_img_embeds.T / self.T  # NxC * CxN
-            sim[list(range(start_id, end_id)), sub_false_labels] = -self.INF
+            # breakpoint()
+            sim[list(range(self.sub_batch_size)), sub_false_labels] = -self.INF
 
             all_sims.append(sim.detach())
 

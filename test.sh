@@ -9,5 +9,6 @@ python main_moco.py --arch resnet50 \
                     --mlp \
                     --aug-plus \
                     --subset 1 \
+                    --save-dir "ckpts-test" \
                     "/mnt/nvme0n1p2/CVPR"
 
