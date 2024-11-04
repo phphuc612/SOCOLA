@@ -1,16 +1,15 @@
-for i in 29
-do
-python main_moco.py --arch resnet50 \
+python main_moco.py --arch vit_b_16 \
                     --lr 0.005 \
-                    --batch-size 1024 \
+                    --batch-size 2048 \
                     --sub-batch-size 8 \
                     --T 0.07 \
                     --workers 2 \
                     --epochs 30 \
                     --cos \
-                    --mlp \
                     --aug-plus \
                     --subset 1 \
-                    --eval-only "/mnt/nvme0n1p2/Moco-MAC/SOCOLAClone/ckpts-shuffle/checkpoint_$(printf "%04d" $i).pth.tar" \
+                    --run-name "shuffle-vit-2" \
+                    --save-dir "ckpts-shuffle-vit2" \
                     "/mnt/nvme0n1p2/CVPR"
-done
+                    # --resume "ckpts-shuffle-vit/checkpoint_0004.pth.tar" \
+

@@ -1,21 +1,11 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-
-from random import shuffle
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class SOCOLA(nn.Module):
-    """
-    Build a MoCo model with: a query encoder, a key encoder, and a queue
-    https://arxiv.org/abs/1911.05722
-    """
-
+    INF = 100000
+    
     def __init__(self, base_encoder, sub_batch_size, dim=128, mlp_dim=4096, T=0.07, mlp=False):
         """
         dim: feature dimension (default: 128)
@@ -56,7 +46,7 @@ class SOCOLA(nn.Module):
         return nn.Sequential(*mlp)
     
     def _build_projector_and_predictor_mlps(self, dim, mlp_dim):
-        pass
+        raise NotImplementedError
 
     def forward(self, all_query_imgs, all_key_imgs, device):
         """
@@ -66,47 +56,65 @@ class SOCOLA(nn.Module):
         Output:
             loss, logits, labels
         """
-        sub_query_images = torch.split(all_query_imgs, self.sub_batch_size)
-        sub_key_images = torch.split(all_key_imgs, self.sub_batch_size)
+        batch_size = all_query_imgs.shape[0]
+        all_imgs = torch.concat([all_query_imgs, all_key_imgs], dim=0)
+        sub_imgs = torch.split(all_imgs, self.sub_batch_size)
+        
         with torch.no_grad():  # no gradient to keys
             self.T.clamp_(0.001, 1)
             key_img_embeds = []
-            for key_imgs in sub_key_images:
+            for key_imgs in sub_imgs:
                 key_img_embeds.append(self.encoder_img(key_imgs))  # keys: NxC
             key_img_embeds = torch.concat(key_img_embeds)
             key_img_embeds = F.normalize(key_img_embeds, dim=1)
         
-            shuffled_idx = torch.randperm(all_query_imgs.shape[0])
+            shuffled_idx = torch.randperm(all_imgs.shape[0])
             key_img_embeds = key_img_embeds[shuffled_idx]
 
-            all_labels = torch.empty_like(shuffled_idx)
-            all_labels.scatter_(0, shuffled_idx, torch.arange(
+            false_labels = torch.empty_like(shuffled_idx)
+            false_labels.scatter_(0, shuffled_idx, torch.arange(
                 len(shuffled_idx)
             ))
-            all_labels = all_labels.to(device)
+            
+            true_labels = torch.arange(len(shuffled_idx))
+            true_labels.scatter_(0, shuffled_idx, torch.arange(
+                len(shuffled_idx)
+            ))
+            for i in range(0, batch_size):
+                true_labels[i], true_labels[i+batch_size] = (
+                    true_labels[i+batch_size].item(), true_labels[i].item()
+                )
+            false_labels = false_labels.numpy().tolist()
+            true_labels = true_labels.to(device)
+            
         all_sims = []
         avg_loss = 0
-        for sub_id, query_imgs in enumerate(sub_query_images):
+        for sub_id, query_imgs in enumerate(sub_imgs):
             start_id = sub_id * self.sub_batch_size
             end_id = start_id + query_imgs.shape[0]
 
             query_img_embeds = self.encoder_img(query_imgs)
             query_img_embeds = F.normalize(query_img_embeds, dim=1)
+            
+            sub_false_labels = false_labels[start_id:end_id]
             # breakpoint()
             # compute similarities
             sim = query_img_embeds @ key_img_embeds.T / self.T  # NxC * CxN
+            # breakpoint()
+            sim[list(range(self.sub_batch_size)), sub_false_labels] = -self.INF
+
             all_sims.append(sim.detach())
 
             # losses
             loss = F.cross_entropy(
-                sim, all_labels[start_id:end_id], reduction="mean")
-            loss /= len(sub_query_images)
+                sim, true_labels[start_id:end_id], reduction="mean")
+            loss /= len(sub_imgs)
             avg_loss += loss.item()
             if loss.grad_fn is not None:
                 loss.backward()
         all_sims = torch.concat(all_sims)
 
-        return avg_loss, all_sims, all_labels
+        return avg_loss, all_sims, true_labels
 
 class SOCOLA_Resnet(SOCOLA):
     def _build_projector_and_predictor_mlps(self, dim, mlp_dim):

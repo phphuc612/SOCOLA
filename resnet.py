@@ -12,8 +12,7 @@ import random
 import shutil
 import time
 import warnings
-import wandb
-import utils
+
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -164,59 +163,12 @@ parser.add_argument(
     help="subset of the training set to use (default: 1)",
 )
 
-parser.add_argument(
-    "--save-dir",
-    default="linear_probing",
-    type=str,
-    help="path to save checkpoint",
-)
-
 best_acc1 = 0
 
 
 def main():
     args = parser.parse_args()
-    runid = None
-    if args.resume or args.evaluate:
-        if not args.resume:
-            path = args.evaluate
-        else:
-            path = args.resume
-        parent_dir = os.path.dirname(path)
-        with open(os.path.join(parent_dir, "runid.txt"), "r") as f:
-            runid = f.read().strip()
-    global run
-    run = wandb.init(
-        project="SOCOLA",
-        group="lincls",
-        config={
-            "architecture": args.arch,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "momentum": args.momentum,
-            "weight_decay": args.weight_decay,
-            "schedule": args.schedule,
-            "workers": args.workers,
-            "pretrained": args.pretrained,
-            "subset": args.subset,
-            "seed": args.seed,
-            "gpu": args.gpu,
-            "multiprocessing_distributed": args.multiprocessing_distributed,
-            "world_size": args.world_size,
-            "rank": args.rank,
-            "dist_url": args.dist_url,
-            "dist_backend": args.dist_backend,
-            "resume": args.resume,
-            "evaluate": args.evaluate,
-            "start_epoch": args.start_epoch,
-            "data": args.data
-        },
-        id=runid,
-        resume="allow",
-    )
-    wandb.define_metric("epochs")
-    wandb.define_metric("epochs/*", step_metric="epochs")
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -293,73 +245,8 @@ def main_worker(gpu, ngpus_per_node, args):
     model.fc.weight.data.normal_(mean=0.0, std=0.01)
     model.fc.bias.data.zero_()
 
-    # load from pre-trained, before DistributedDataParallel constructor
-    if args.pretrained:
-        if os.path.isfile(args.pretrained):
-            print("=> loading checkpoint '{}'".format(args.pretrained))
-            checkpoint = torch.load(args.pretrained, map_location="cpu")
-
-            # breakpoint()
-            # rename moco pre-trained keys
-            state_dict = checkpoint["state_dict"]
-            for k in list(state_dict.keys()):
-                # retain only encoder_q up to before the embedding layer
-                if k.startswith("encoder_img") and not k.startswith(
-                    "encoder_img.fc"
-                ):
-                    # remove prefix
-                    state_dict[k[len("encoder_img."):]] = state_dict[k]
-                # delete renamed or unused k
-                del state_dict[k]
-
-            # breakpoint()
-            args.start_epoch = 0
-            msg = model.load_state_dict(state_dict, strict=False)
-            assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
-
-            print("=> loaded pre-trained model '{}'".format(args.pretrained))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.pretrained))
-
-    if args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int(
-                (args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[args.gpu]
-            )
-
-            # define loss function (criterion) and optimizer
-            criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-        else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
-            criterion = nn.CrossEntropyLoss().cuda()
-    elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
-        # define loss function (criterion) and optimizer
-        criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    else:
-        # DataParallel will divide and allocate batch_size to all available GPUs
-        # if args.arch.startswith("alexnet") or args.arch.startswith("vgg"):
-        #     model.features = torch.nn.DataParallel(model.features)
-        #     model.cuda()
-        # else:
-        #     model = torch.nn.DataParallel(model).cuda()
-        model = model.to(device)
-        criterion = nn.CrossEntropyLoss().to(device)
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
 
     print(model)
     # optimize only the linear classifier
@@ -369,35 +256,11 @@ def main_worker(gpu, ngpus_per_node, args):
     #     parameters, args.lr, momentum=args.momentum, weight_decay=args.weight_decay
     # )
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         model.parameters(),
         args.lr,
         weight_decay=args.weight_decay,
     )
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = "cuda:{}".format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint["epoch"]
-            best_acc1 = checkpoint["best_acc1"]
-            if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(args.gpu)
-            model.load_state_dict(checkpoint["state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            print(
-                "=> loaded checkpoint '{}' (epoch {})".format(
-                    args.resume, checkpoint["epoch"]
-                )
-            )
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
@@ -462,45 +325,24 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
-    # wandb.watch(model, log="all", log_freq=args.print_freq)
-
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train_log = train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        val_log = validate(val_loader, model, criterion, args)
-        acc1 = val_log["epochs/val-acc@1"]
+        acc1 = validate(val_loader, model, criterion, args)
+
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        wandb.log({**train_log, **val_log, "epochs": epoch})
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
-            pwd = os.getcwd()
-            directory = os.path.join(pwd, args.save_dir)
-            if not os.path.exists(directory):
-                os.makedirs(directory)
-                if not args.resume:
-                    with open(os.path.join(directory, "runid.txt"), "w") as f:
-                        f.write(run.id)
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "arch": args.arch,
-                    "state_dict": model.state_dict(),
-                    "best_acc1": best_acc1,
-                    "optimizer": optimizer.state_dict(),
-                },
-                is_best=False,
-                filename=os.path.join(directory, "linear_checkpoint_{:04d}.pth.tar".format(epoch)),
-            )
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -510,7 +352,6 @@ def main_worker(gpu, ngpus_per_node, args):
                     "optimizer": optimizer.state_dict(),
                 },
                 is_best,
-                filename=os.path.join(directory, "linear_best_model.pth.tar".format(epoch)),
             )
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
@@ -535,7 +376,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     BatchNorm in train mode may revise running mean/std (even if it receives
     no gradient), which are part of the model parameters too.
     """
-    wandb.watch(model, log="all", log_freq=args.print_freq)
     model.eval()
 
     end = time.time()
@@ -567,27 +407,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "avg_loss": loss.item(),
-                    "acc@1": acc1[0].item(),
-                    "acc@5": acc5[0].item(),
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
-                step=int(i / len(train_loader) * 100) + epoch * 100,
-            )
-
-    return {
-        "epochs/train-avg_loss": losses.avg,
-        "epochs/train-acc@1": top1.avg,
-        "epochs/train-acc@5": top5.avg,
-        "epochs/train-lr": optimizer.param_groups[0]["lr"],
-    }
 
 
 def validate(val_loader, model, criterion, args):
-
     batch_time = AverageMeter("Time", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
@@ -630,11 +452,7 @@ def validate(val_loader, model, criterion, args):
                 top1=top1, top5=top5)
         )
 
-    return {
-        "epochs/val-avg_loss": losses.avg,
-        "epochs/val-acc@1": top1.avg,
-        "epochs/val-acc@5": top5.avg,
-    }
+    return top1.avg
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -659,7 +477,9 @@ def sanity_check(state_dict, pretrained_weights):
 
         # name in pretrained model
         k_pre = (
-            "encoder_img." + k
+            "module.encoder_q." + k[len("module."):]
+            if k.startswith("module.")
+            else "module.encoder_q." + k
         )
 
         assert (
