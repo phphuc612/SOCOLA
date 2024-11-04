@@ -211,7 +211,6 @@ def main():
             name=args.run_name,
             config={
                 "arch": args.arch,
-                "temp": args.T,
                 "dim": args.dim,
                 "sub_batch_size": args.sub_batch_size,
                 "lr": args.lr,
@@ -553,9 +552,6 @@ def train(
         "lr", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
     )
     metric_logger.add_meter(
-        "temp", utils.SmoothedValue(window_size=50, fmt="{value:.6f}")
-    )
-    metric_logger.add_meter(
         "avg_loss", utils.SmoothedValue(window_size=50, fmt="{value:.4f}")
     )
 
@@ -580,7 +576,6 @@ def train(
 
         metric_logger.update(avg_loss=avg_loss)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(temp=model.T.item())
         metric_logger.update(acc1=acc1[0].item())
         metric_logger.update(acc5=acc5[0].item())
         if iteration_cnt % print_freq == 0 and not args.debug:
@@ -588,7 +583,6 @@ def train(
                 "epoch": epoch,
                 "avg_loss": avg_loss,
                 "lr": optimizer.param_groups[0]["lr"],
-                "temp": model.T.item(),
                 "acc1": acc1[0].item(),
                 "acc5": acc5[0].item(),
             }, step=int(iteration_cnt / len(data_loader) * 100) + epoch * 100)
