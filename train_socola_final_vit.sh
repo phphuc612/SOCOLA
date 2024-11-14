@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES=1 python main_moco.py --arch resnet50 \
+CUDA_VISIBLE_DEVICES=4 python main_socola_final.py --arch vit_b_16 \
                     --seed 42 \
                     --lr 0.005 \
-                    --batch-size 256 \
+                    --batch-size 1024 \
                     --workers 2 \
                     --epochs 50 \
                     --cos \
@@ -9,6 +9,6 @@ CUDA_VISIBLE_DEVICES=1 python main_moco.py --arch resnet50 \
                     --aug-plus \
                     --subset 1 \
                     --print-freq 5 \
-                    --save-dir "ckpts-moco-rn50" \
-                    --run-name "moco-resnet50" \
+                    --save-dir "ckpts-socola-final-vit" \
+                    --run-name "socola-final-vit" \
                     "/home/ubuntu/work/data"
