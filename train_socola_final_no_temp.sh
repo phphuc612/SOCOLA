@@ -1,4 +1,4 @@
-python main_socola_final_no_temp.py --arch resnet50 \
+CUDA_VISIBLE_DEVICES=6 python main_socola_final_no_temp.py --arch resnet50 \
                     --seed 42 \
                     --lr 0.005 \
                     --batch-size 1024 \
@@ -8,6 +8,8 @@ python main_socola_final_no_temp.py --arch resnet50 \
                     --mlp \
                     --aug-plus \
                     --subset 1 \
+                    --print-freq 5 \
                     --save-dir "ckpts-socola-final-no-temp-rn50" \
                     --run-name "socola-final-no-temp-resnet50" \
-                    "/mnt/nvme0n1p2/CVPR"
+                    --resume "/home/ubuntu/work/SOCOLA/ckpts-socola-final-no-temp-rn50/checkpoint_0004.pth.tar" \
+                    "/home/ubuntu/work/data"
